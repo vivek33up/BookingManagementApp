@@ -1,7 +1,6 @@
 import { db } from "../../db/index.js";
 import { resources,bookings } from "../../db/schema.js";
 import { eq, sql } from "drizzle-orm";
-
 export async function createResource(resourceData) {
   const [createdResource] = await db
     .insert(resources)
@@ -91,8 +90,12 @@ function generateSlots(openTime, closeTime, slotMinutes) {
   return slots;
 }
 
-export async function getResourceAvailability(resourceId, date) {
-  const resource = await getResourceById(resourceId);
+export async function getResourceAvailability(resourceId, date, connection=db) {
+   const [resource] = await connection
+    .select()
+    .from(resources)
+    .where(eq(resources.id, resourceId))
+    .limit(1);
 
   if (!resource) {
     return null;
@@ -102,7 +105,7 @@ export async function getResourceAvailability(resourceId, date) {
   const dayStart = new Date(`${date}T00:00:00+05:30`);
   const dayEnd = new Date(`${date}T23:59:59.999+05:30`);
 
-  const result = await db.execute(sql`
+  const result = await connection.execute(sql`
     SELECT
       lower(during) AS start_at,
       upper(during) AS end_at
