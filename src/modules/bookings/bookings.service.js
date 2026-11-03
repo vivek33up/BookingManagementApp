@@ -1,9 +1,9 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, lte, eq, sql } from "drizzle-orm";
 import { db } from "../../db/index.js";
 import { bookings, resources } from "../../db/schema.js";
 import { getResourceAvailability } from "../resources/resources.service.js";
 import { env } from "../../config/env.js";
-
+import { redisClient } from "../../db/redis.js";
 
 async function createBookingWithConstraint({ userId, resourceId, date, startTime }) {
   const [resource] = await db
@@ -208,6 +208,170 @@ async function createBookingWithOptimisticLock({
   });
 }
 
+//________________ADDING HOLD__________
+export async function createBookingHold({
+  userId,
+  resourceId,
+  date,
+  startTime,
+}) {
+  return db.transaction(async (tx) => {
+    // Serialize hold creation for this resource.
+    const [resource] = await tx
+      .select({ id: resources.id })
+      .from(resources)
+      .where(eq(resources.id, resourceId))
+      .for("update")
+      .limit(1);
+
+    if (!resource) {
+      return { error: "RESOURCE_NOT_FOUND" };
+    }
+
+    // Expire this resource's old holds so they no longer block its slots.
+    const now = new Date();
+
+    await tx
+      .update(bookings)
+      .set({ status: "expired", updatedAt: now })
+      .where(
+        and(
+          eq(bookings.resourceId, resourceId),
+          eq(bookings.status, "held"),
+          lte(bookings.holdExpiresAt, now),
+        ),
+      );
+
+    const availability = await getResourceAvailability(
+      resourceId,
+      date,
+      tx,
+    );
+
+    const selectedSlot = availability?.slots.find(
+      (slot) => slot.startTime === startTime,
+    );
+
+    if (!selectedSlot) {
+      return { error: "SLOT_UNAVAILABLE" };
+    }
+
+    const startAt = new Date(`${date}T${selectedSlot.startTime}:00+05:30`);
+    const endAt = new Date(`${date}T${selectedSlot.endTime}:00+05:30`);
+    const holdExpiresAt = new Date(
+      Date.now() + env.HOLD_TTL_SECONDS * 1000,
+    );
+
+    const [booking] = await tx
+      .insert(bookings)
+      .values({
+        resourceId,
+        userId,
+        during: sql`tstzrange(
+          ${startAt.toISOString()}::timestamptz,
+          ${endAt.toISOString()}::timestamptz,
+          '[)'
+        )`,
+        status: "held",
+        holdExpiresAt,
+      })
+      .returning({
+        id: bookings.id,
+        resourceId: bookings.resourceId,
+        userId: bookings.userId,
+        status: bookings.status,
+        holdExpiresAt: bookings.holdExpiresAt,
+        createdAt: bookings.createdAt,
+      });
+
+    // Redis keeps a timer for this hold. The database expiry worker
+    // we add next will update the booking row when the timer runs out.
+    await redisClient.set(`booking-hold:${booking.id}`, booking.id, {
+      EX: env.HOLD_TTL_SECONDS,
+    });
+
+    return { booking };
+  });
+}
+export async function confirmBookingHold({ bookingId, userId }) {
+  const result = await db.transaction(async (tx) => {
+    // Lock this user's booking while checking and confirming it.
+    const [hold] = await tx
+      .select({
+        id: bookings.id,
+        status: bookings.status,
+        holdExpiresAt: bookings.holdExpiresAt,
+      })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.id, bookingId),
+          eq(bookings.userId, userId),
+        ),
+      )
+      .for("update")
+      .limit(1);
+
+    if (!hold) {
+      return { error: "HOLD_NOT_FOUND" };
+    }
+
+    if (hold.status !== "held") {
+      return { error: "HOLD_NOT_ACTIVE" };
+    }
+
+    const now = new Date();
+
+    if (!hold.holdExpiresAt || hold.holdExpiresAt <= now) {
+      await tx
+        .update(bookings)
+        .set({ status: "expired", updatedAt: now })
+        .where(
+          and(
+            eq(bookings.id, bookingId),
+            eq(bookings.status, "held"),
+          ),
+        );
+
+      return { error: "HOLD_EXPIRED" };
+    }
+
+    const [booking] = await tx
+      .update(bookings)
+      .set({
+        status: "confirmed",
+        holdExpiresAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(bookings.id, bookingId),
+          eq(bookings.userId, userId),
+          eq(bookings.status, "held"),
+        ),
+      )
+      .returning({
+        id: bookings.id,
+        resourceId: bookings.resourceId,
+        userId: bookings.userId,
+        status: bookings.status,
+        createdAt: bookings.createdAt,
+      });
+
+    return { booking };
+  });
+
+  // The booking is now confirmed, so its Redis timer can be removed.
+  if (result.booking) {
+    try {
+      await redisClient.del(`booking-hold:${bookingId}`);
+    } catch (error) {
+      console.error("Could not remove confirmed booking's Redis key:", error);
+    }
+  }
+
+  return result;
+}
 export async function listUserBookings(userId) {
   return db
     .select({
