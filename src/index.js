@@ -4,8 +4,10 @@ import { db } from "./db/index.js";
 import authRouter from "./modules/auth/auth.routes.js";
 import resourcesRouter from "./modules/resources/resources.routes.js";
 import bookingsRouter from "./modules/bookings/bookings.routes.js";
+import { connectRedis } from "./db/redis.js";
+import { startHoldExpiryWorker } from "./modules/bookings/hold-expiry.worker.js";
 const app=express();
-const PORT=3000;
+const PORT=env.PORT||3000;
 app.use(express.json());
 app.get("/",(req,res)=>{
     res.send("Booking system API is running");
@@ -23,6 +25,21 @@ app.get("/health", async (req, res) => {
 app.use("/auth", authRouter);
 app.use("/resources", resourcesRouter);
 app.use("/bookings", bookingsRouter);
-app.listen(PORT,()=>{
-    console.log(`Server is listening on PORT ${PORT}`);
-})
+// app.listen(PORT,()=>{
+//     console.log(`Server is listening on PORT ${PORT}`);
+// })
+async function startServer() {
+  try {
+    const redisReply = await connectRedis();
+    console.log("Redis:", redisReply);
+    startHoldExpiryWorker();
+    app.listen(env.PORT, () => {
+      console.log(`Server is listening on PORT ${env.PORT}`);
+    });
+  } catch (error) {
+    console.error("Could not start the server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
