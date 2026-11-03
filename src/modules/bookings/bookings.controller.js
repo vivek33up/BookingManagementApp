@@ -41,7 +41,7 @@ export async function createBookingController(req, res, next) {
     const postgresCode = error?.cause?.code ?? error?.code;
 
     // PostgreSQL uses 23P01 for an exclusion constraint violation.
-    if (postgresCode === "23P01") {
+    if (postgresCode === "23P01" || postgresCode === "40P01") {
       return res.status(409).json({
         error: "This time slot is already booked",
       });
